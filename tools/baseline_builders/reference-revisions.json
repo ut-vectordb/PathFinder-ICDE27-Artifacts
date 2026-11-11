@@ -1,0 +1,19 @@
+{
+  "FAVOR": {
+    "url": "https://github.com/JunjieSong123/FAVOR.git",
+    "commit": "00a24e6c6b47ba46058cfe23cfaad0ea96677055",
+    "submodules": []
+  },
+  "CGIF": {
+    "url": "https://github.com/rutgers-db/CGIF.git",
+    "commit": "aa525c18b11026414365818ffaa90af113d50053",
+    "submodules": [
+      "835b3ea1bdbafbcbb5cb7846b06f10981b899637 third_party/faiss (v1.10.0-21-g835b3ea1b)"
+    ]
+  },
+  "PathSeer": {
+    "url": "https://github.com/lizhiyuell/PathSeer.git",
+    "commit": "6e0cd1df08927651013823f1f5458e6fb4a2336f",
+    "submodules": []
+  }
+}

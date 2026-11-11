@@ -1,0 +1,4 @@
+build/
+results/
+scripts/config.sh
+*.pyc

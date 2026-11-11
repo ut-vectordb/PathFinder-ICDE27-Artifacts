@@ -1,0 +1,371 @@
+#include <chrono>
+#include <fstream>
+#include <iostream>
+#include <iomanip>
+#include <vector>
+#include <random>
+#include <algorithm>
+#include <functional>
+
+#include <boost/program_options.hpp>
+
+#include <omp.h>
+#include <filesystem>
+
+#include "run_search.h"
+#include "artifact_paths.h"
+
+namespace po = boost::program_options;
+using namespace std;
+using namespace ANNS;
+
+int flag0 = 102;
+int flag1 = -1;
+int flag2 = -1;
+int flag3 = -1;
+int flag4 = -1;
+int flag5 = -1;
+int flag6 = -1;
+int flag7 = 0;
+double flag8 = 1e-2;
+int flag9 = -1;
+
+int fanout;
+
+std::shared_ptr<ANNS::DistanceHandler> distance_handler;
+
+int nb, nq, dim, na;
+ANNS::IdxType M, ef_con;
+uint32_t num_threads;
+
+void calc_ground_truth(
+    shared_ptr<ANNS::IStorage> base_storage, shared_ptr<ANNS::IStorage> query_storage,
+    int K,
+    std::function<bool(int, int)> predicate,
+    pair<IdxType, float> *gt) {
+
+    int missed_gt = 0;
+
+    vector<pair<int, int>> high_selectivity_ids;
+
+    #pragma omp parallel for schedule (dynamic, 4) reduction(+:missed_gt)
+    for (int q = 0; q < nq; q++) {
+        auto query = query_storage->get_vector(q);
+        auto compdist = [&](IdxType pid) {
+            return distance_handler->compute(query, base_storage->get_vector(pid), dim);
+        };
+
+        // vector<pair<IdxType, float>> ranking;
+        priority_queue<pair<float, IdxType>> ranking;
+        for (int i = 0; i < nb; ++i) {
+            if (predicate(i, q)) {
+                // ranking.emplace_back(i, compdist(i));
+                ranking.push(make_pair(compdist(i), i));
+                if (ranking.size() > K) { ranking.pop(); }
+            }
+        }
+
+        std::vector<std::pair<IdxType, float>> sorted;
+        sorted.reserve(ranking.size());
+
+        while (!ranking.empty()) {
+            auto [dist, id] = ranking.top();
+            ranking.pop();
+            sorted.emplace_back(id, dist);
+        }
+
+        // Sort by increasing distance
+        std::sort(sorted.begin(), sorted.end(),
+                [](const std::pair<IdxType, float>& a,
+                    const std::pair<IdxType, float>& b) {
+                    return a.second < b.second;
+                });
+
+        for (auto k=0; k<K; ++k) {
+            if (k < sorted.size()) {
+                gt[q*K+k] = sorted[k];
+            } else {
+                gt[q*K+k].first = -1;
+            }
+        }
+        if (sorted.size() < K) {
+            std::cerr << "Warning: Query " << q << " has only " << sorted.size()
+                  << " ground truth entries, less than K=" << K
+                  << ". Maximum recall will be less than 100% for this query." << std::endl;
+            missed_gt += (K - sorted.size());
+            #pragma omp critical
+            high_selectivity_ids.emplace_back(sorted.size(), q);
+        }
+    }
+
+    if (missed_gt > 0) {
+        std::cout << "Warning: Total of " << missed_gt << "/" << nq * K << " ground truth entries were missing across all queries." << std::endl;
+        double miss_rate = (double)missed_gt / nq / K;
+        if (miss_rate > 0.3) {
+            std::cout << "Valid results too few (" << miss_rate * 100 << "% missing), refusing to proceed." << std::endl;
+            abort();
+        }
+    }
+}
+
+class UseSingleUnitGraphOOR : public IQueryPlanner {
+public:
+    UseSingleUnitGraphOOR(AttrTreeNode *g_ptr) { g.ag_ptr = g_ptr; g.filter_strategy = unit_graph_ref::NOCHECK; }
+    std::vector<unit_graph_ref> operator()(const QueryType &preds) const override { return {g}; }
+    unit_graph_ref g;
+};
+
+class UseSingleUnitGraphInFilter : public IQueryPlanner {
+public:
+    UseSingleUnitGraphInFilter(AttrTreeNode *g_ptr) { g.ag_ptr = g_ptr; g.filter_strategy = unit_graph_ref::CHECK_ALL; }
+    std::vector<unit_graph_ref> operator()(const QueryType &preds) const override { return {g}; }
+    unit_graph_ref g;
+};
+
+int main(int argc, char** argv) {
+
+    // common auguments
+    std::string data_type("float"), dist_fn("L2"), base_bin_file, query_bin_file, index_path_prefix;
+    std::string attr_bin_file;
+    std::string query_tsv_file;
+    string dataset; // "sift", "gist"
+
+    // parameters for HNSW
+    int n_entry = 15;
+
+    int K = 10;
+
+    try {
+        po::options_description desc{"Arguments"};
+
+        desc.add_options()("help,h", "Print information on arguments");
+        desc.add_options()("num_threads", po::value<uint32_t>(&num_threads)->default_value(64),
+                           "Number of threads to use");
+        desc.add_options()("dataset", po::value<string>(&dataset)->default_value("sift"),
+                           "Dataset to use, either 'sift' or 'gist'");
+
+        desc.add_options()("flag7", po::value<int>(&flag7)->default_value( 5)); // for tree height cutoff
+        desc.add_options()("fanout", po::value<int>(&fanout)->default_value(4),
+                           "fanout to build the graph");
+
+        po::variables_map vm;
+        po::store(po::parse_command_line(argc, argv, desc), vm);
+        if (vm.count("help")) { std::cout << desc; return 0; }
+        po::notify(vm);
+    } catch (const std::exception &ex) {
+        std::cerr << ex.what() << std::endl;
+        return -1;
+    }
+
+    omp_set_num_threads(num_threads);
+
+    string home(pf_path(""));
+    string home_redcaps(pf_path("datasets/redcaps/"));
+    string home_siftgist(pf_path("datasets/sift-gist-synthetic/"));
+    string home_wit(pf_path("datasets/wit/"));
+
+    attr_bin_file = "Synthetic";
+    // string index_dir_prefix = home + "data/index_files/mar30_mixed_attrs_fanout/";
+    string index_dir_prefix = home + "data/index_files/mar30_mixed_attrs_build_time/";
+    if (dataset == "sift100M") {
+        base_bin_file = pf_path("datasets/sift100m/sift100m_base.bin");
+        query_bin_file = pf_path("datasets/sift100m/sift100m_query.bin");
+        attr_bin_file = pf_path("workloads/mar30_new_mixed_attributes/step0_attributes/SIFT100M-mixed_attrs.bin");
+        query_tsv_file = "./queries.tsv";
+
+        index_path_prefix = index_dir_prefix + "sift100M-" + to_string(fanout) + "way/";
+
+        M = 32;
+        ef_con = 200;
+        data_type = "uint8";
+    } else if (dataset == "sift3") {
+        base_bin_file = home + "data/sift/sift_base.bin";
+        query_bin_file = home + "data/sift/sift_query.bin";
+        attr_bin_file = pf_path("workloads/mar30_new_mixed_attributes/step0_attributes/SIFT-mixed_attrs.bin");
+        query_tsv_file = "./queries.tsv";
+
+        index_path_prefix = index_dir_prefix + "sift-3attr-" + to_string(fanout) + "way/";
+
+        M = 32;
+        ef_con = 200;
+    } else if (dataset == "gist3") {
+        base_bin_file = home + "data/gist/gist_base.bin";
+        query_bin_file = home + "data/gist/gist_query.bin";
+        attr_bin_file = pf_path("workloads/mar30_new_mixed_attributes/step0_attributes/GIST-mixed_attrs.bin");
+        query_tsv_file = "./queries.tsv";
+
+        index_path_prefix = index_dir_prefix + "gist-3attr-" + to_string(fanout) + "way/";
+
+        M = 64;
+        ef_con = 200;
+    } else if (dataset == "arxiv") {
+        base_bin_file = home + "data/arxiv/arxiv-embeddings.bin";
+        query_bin_file = home + "data/arxiv/arxiv-query.bin";
+        attr_bin_file = home + "data/arxiv/arxiv-attributes-time-class-cite.bin";
+        query_tsv_file = "./queries.tsv";
+
+        index_path_prefix = index_dir_prefix + "arxiv-" + to_string(fanout) + "way/";
+
+        M = 64;
+        ef_con = 200;
+    } else if (dataset == "redcaps") {
+        base_bin_file = home_redcaps + "redcaps-embeddings.bin";
+        query_bin_file = home_redcaps + "redcaps-query.bin";
+        attr_bin_file = home_redcaps + "redcaps-attributes-subreddit-time-upvote.bin";
+        query_tsv_file = "./queries.tsv";
+
+        index_path_prefix = index_dir_prefix + "redcaps-" + to_string(fanout) + "way/";
+
+        M = 64;
+        ef_con = 200;
+    } else if (dataset == "wit") {
+        base_bin_file = pf_path("datasets/wit/embeddings_normalized.bin");
+        query_bin_file = pf_path("datasets/wit/embeddings_query_1K_normalized.bin");
+        attr_bin_file = pf_path("datasets/wit/df_blob_float32.bin");
+        query_tsv_file = "./queries.tsv";
+
+        index_path_prefix = index_dir_prefix + "WIT-" + to_string(fanout) + "way/";
+
+        M = 64;
+        ef_con = 200;
+    } else {
+        cerr << "Unknown dataset: " << dataset << endl;
+        return -1;
+    }
+    filesystem::create_directories(index_path_prefix);
+    string gt_path_prefix = index_path_prefix + "gt/";
+    filesystem::create_directories(gt_path_prefix);
+
+    vector<string> idx_path;
+    string gt_path = "./groundtruth.bin";
+
+    vector<int> ef_searches = {10,50,100,200,300,400,500,1000,1500,2000,2500,3000};
+
+    std::shared_ptr<ANNS::IStorage> base_storage = ANNS::create_storage(data_type);
+    base_storage->load_from_file(base_bin_file, "");
+    std::shared_ptr<ANNS::IStorage> query_storage = ANNS::create_storage(data_type);
+    query_storage->load_from_file(query_bin_file, "");
+
+    vector<float> attr;
+    if (attr_bin_file == "Synthetic") {
+        cerr << "Provide a prepared data source!" << endl;
+        return -1;
+    } else {
+        attr = read_binary_float32(attr_bin_file);
+    }
+
+    nb = base_storage->get_num_points();
+    nq = query_storage->get_num_points();
+    dim = base_storage->get_dim();
+    na = attr.size() / nb;
+
+    auto [preds, schema] = read_queries_from_tsv(query_tsv_file);
+    if (preds.size() > nq)
+        preds.resize(nq);   // for GIST, preds is 10K but nq is 1K
+    schema.describe();
+    my_assert(na == schema.names.size());
+
+    distance_handler = ANNS::get_distance_handler(data_type, dist_fn);
+
+    string idx_and_estimator_prefix = index_path_prefix + "attr" + "_equidepth";
+    vector<shared_ptr<irg_attr>> indices;
+    for (int i = 0; i < na; i++) {
+        idx_path.push_back(idx_and_estimator_prefix + to_string(i));
+        indices.emplace_back();
+    }
+    omp_set_nested(1);
+
+    for (int i = 0; i < na; i++) {
+        // if (dataset == "sift100M") continue;
+        cout << "Building graph for attribute #" << i << " using " << num_threads << " threads" << endl;
+        auto link_start = std::chrono::high_resolution_clock::now();
+
+        if (schema.types[i] == QueryType::PredType::RANGE) {
+            int maxdepth = 2;
+            // int fanout = 4;
+            indices[i] = irg_attr::build_or_load_graph_for_numerical_attr(attr, i, maxdepth, base_storage, idx_path[i], distance_handler, M, ef_con, num_threads, fanout);
+        } else
+            indices[i] = irg_attr::build_or_load_graph_for_hash_attr(attr, i, base_storage, idx_path[i], distance_handler, M, ef_con, num_threads);
+
+        auto link_end = std::chrono::high_resolution_clock::now();
+        auto link_time = std::chrono::duration_cast<std::chrono::milliseconds>(link_end - link_start).count();
+        std::cout << "@@@ Index #" << i << " build time = " << link_time / 1000.00 << " seconds." << std::endl;
+
+        indices[i]->_attr_id = i;
+        indices[i]->_attr = &attr;
+        indices[i]->_na = na;
+    }
+
+    for (int i = 0; i < na; i++) {
+        if (!indices[i]) continue;
+        // indices[i]->cutoff_too_deep(flag7);
+
+        cout << "Map global ID to edge table and free the graph object..." << endl;
+        omp_set_num_threads(96);
+        indices[i]->map_global_id_directly_to_edge_table();
+        omp_set_num_threads(num_threads);
+        cout << "Done mapping" << endl;
+
+        int unit_graph_count = 0;
+        int maxdepth = 0;
+        size_t total_edge_count = 0;
+        if (indices[i]->schema == irg_attr::NUMERICAL) {
+            for (auto p : indices[i]->tree->treenodes) {
+                if (p) {
+                    unit_graph_count++;
+                    total_edge_count += p->size_e;
+                }
+            }
+            maxdepth = indices[i]->tree->max_depth;
+        } else {
+            unit_graph_count = indices[i]->hash->hashednodes.size();
+            for (auto p : indices[i]->hash->hashednodes) {
+                if (p) {
+                    total_edge_count += p->size_e;
+                }
+            }
+            maxdepth = 1;
+        }
+        cout << "@@@ Index #" << i << " has " << unit_graph_count << " unit graphs; layer count (=maxdepth+1) = " << maxdepth + 1 << "; total_edges = " << total_edge_count << endl;
+    }
+
+    // // HNSW root and Vamana build skipped — reusing old numbers
+    // // load root: if we run normally ("-1") or request to build attr #0 ("0")
+    // {
+    //     string root_path = idx_and_estimator_prefix + "_root.txt";
+    //     string root_upper_path = idx_and_estimator_prefix + "_root_upper.txt";
+    //     if (filesystem::is_regular_file(root_upper_path) && filesystem::is_regular_file(root_path)) {
+    //         cout << "Loading HNSW root graph" << endl;
+    //     } else {
+    //         cout << "Building HNSW root graph using " << num_threads << " threads" << endl;
+    //         Hnsw h;
+    //         auto g1 = make_shared<Graph>(nb);
+    //         bool randomize = false; bool merge_upper_layers = false;
+    //         h.build_HNSWLib(base_storage, distance_handler, g1, M, ef_con, num_threads, randomize, merge_upper_layers);
+    //         g1->save(root_path);
+    //         h._upper_layer->save(root_upper_path);
+    //     }
+    // }
+
+    // // Additionally, build Vamana
+    // {
+    //     auto g2 = make_shared<Graph>(nb);
+    //     string fname(filesystem::path(index_path_prefix) / "g_vamana.txt");
+    //     if (filesystem::is_regular_file(fname)) {
+    //         g2->load(fname);
+    //     } else {
+    //         Hnsw va(false);
+    //         va.fixed_alpha = 1.2;
+    //         auto link_start = std::chrono::high_resolution_clock::now();
+    //         va.build_NSW(base_storage, distance_handler, g2, M, ef_con, num_threads);
+    //         auto link_end = std::chrono::high_resolution_clock::now();
+    //         auto link_time = std::chrono::duration_cast<std::chrono::milliseconds>(link_end - link_start).count();
+    //         std::cout << "@@@ Vamana build time = " << link_time / 1000.00 << " seconds." << std::endl;
+    //         g2->save(fname);
+    //     }
+    //     size_t total_byte_count = g2->get_index_size();
+    //     cout << "@@@ Edge count (Vamana) = " << total_byte_count / 4 << endl;
+    // }
+
+    return 0;
+}
